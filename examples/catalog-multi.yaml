@@ -1,0 +1,61 @@
+# Three disjoint time shards, one per engine. A query window must be covered
+# by the selected shards or resolution fails with coverage_gap.
+tables:
+  logs:
+    signal: logs
+    time_column: timestamp
+    columns:
+      - {name: timestamp, type: timestamp}
+      - {name: service, type: string}
+      - {name: level, type: string}
+      - {name: latency_ms, type: float64}
+      - {name: partition, type: string}
+
+backends:
+  omni:
+    signals: [logs, traces]
+    enforces_partition_scope: false
+  bigquery:
+    signals: [logs, traces, metrics]
+    enforces_partition_scope: true
+  clickhouse:
+    signals: [logs, traces, metrics]
+    enforces_partition_scope: true
+
+coverage_groups:
+  archive:
+    mode: time
+
+endpoints:
+  - id: omni-prod
+    backend: omni
+    tables: [logs]
+    role: shard
+    coverage_group: archive
+    range: {from: "2026-11-01T00:00:00Z", to: "2026-11-08T00:00:00Z"}
+    source: logs.default
+    tags: {region: us-east-1}
+    columns:
+      timestamp: "@timestamp"
+      service: service
+      level: level
+      latency_ms: latency_ms
+      partition: partition
+  - id: bq-prod
+    backend: bigquery
+    tables: [logs]
+    role: shard
+    coverage_group: archive
+    range: {from: "2026-11-08T00:00:00Z", to: "2026-11-15T00:00:00Z"}
+    source: strata_prod.telemetry.logs
+    tags: {region: us}
+    columns: {timestamp: timestamp, service: service, level: level, latency_ms: latency_ms, partition: partition}
+  - id: ch-prod
+    backend: clickhouse
+    tables: [logs]
+    role: shard
+    coverage_group: archive
+    range: {from: "2026-11-15T00:00:00Z", to: "2026-11-22T00:00:00Z"}
+    source: strata.logs
+    tags: {region: eu}
+    columns: {timestamp: timestamp, service: service, level: level, latency_ms: latency_ms, partition: partition}

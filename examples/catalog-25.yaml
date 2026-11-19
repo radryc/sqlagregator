@@ -1,0 +1,255 @@
+# 25 registered endpoints, only 4 of which are real disjoint shards.
+# The other 21 are replicas/mirrors that must never be summed.
+tables:
+  logs:
+    signal: logs
+    time_column: timestamp
+    columns:
+      - {name: timestamp, type: timestamp}
+      - {name: service, type: string}
+      - {name: level, type: string}
+      - {name: message, type: string}
+      - {name: trace_id, type: string}
+      - {name: partition, type: string}
+
+backends:
+  duckdb-local:
+    signals: [logs, traces, metrics]
+    enforces_partition_scope: true
+  clickhouse:
+    signals: [logs, traces, metrics]
+    enforces_partition_scope: true
+  omni:
+    signals: [logs, traces]
+    enforces_partition_scope: false
+  bigquery:
+    signals: [logs, traces, metrics]
+    enforces_partition_scope: true
+
+coverage_groups:
+  monofs-local:
+    mode: hash
+    members: 4
+
+endpoints:
+  - id: node-01
+    backend: duckdb-local
+    tables: [logs]
+    role: shard
+    coverage_group: monofs-local
+    source: logs
+    tags: {pool: primary}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-02
+    backend: duckdb-local
+    tables: [logs]
+    role: shard
+    coverage_group: monofs-local
+    source: logs
+    tags: {pool: primary}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-03
+    backend: duckdb-local
+    tables: [logs]
+    role: shard
+    coverage_group: monofs-local
+    source: logs
+    tags: {pool: primary}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-04
+    backend: duckdb-local
+    tables: [logs]
+    role: shard
+    coverage_group: monofs-local
+    source: logs
+    tags: {pool: primary}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-05
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-06
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-07
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-08
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-09
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-10
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-11
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-12
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-13
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-14
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-15
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-16
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-17
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-18
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-19
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-20
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-21
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-22
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-23
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-24
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}
+  - id: node-25
+    backend: duckdb-local
+    tables: [logs]
+    role: replica
+    coverage_group: monofs-local
+    replica_of: monofs-local
+    source: logs
+    tags: {pool: legacy}
+    columns: {timestamp: timestamp, service: service, level: level, message: message, trace_id: trace_id, partition: partition}

@@ -1,0 +1,10 @@
+go 1.26
+
+use (
+	.
+	./cmd/sqlag
+	./drivers/bigquery
+	./drivers/clickhouse
+	./drivers/cloudwatchlogsinsights
+	./drivers/omni
+)
