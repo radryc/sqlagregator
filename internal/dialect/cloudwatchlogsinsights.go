@@ -2,6 +2,7 @@ package dialect
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -105,6 +106,22 @@ func (CloudWatchLogsInsights) NestedField(path []string) (string, error) {
 
 func (CloudWatchLogsInsights) ILike(expr, pattern string) (string, error) {
 	return "(LOWER(" + expr + ") LIKE LOWER(" + pattern + "))", nil
+}
+
+// TimeRange renders the query window with FROM_UNIXTIME. Logs Insights SQL
+// exposes @timestamp as a string ("2026-11-20 12:05:35.643"), and comparing
+// it to CAST(<RFC3339> AS TIMESTAMP) or a TIMESTAMP literal matches zero
+// records even though the query reports status Complete. Unix-time bounds
+// compare correctly and keep the pushdown bounded.
+func (CloudWatchLogsInsights) TimeRange(expr string, from, to time.Time) (string, error) {
+	return "(" + expr + " >= FROM_UNIXTIME(" + unixSeconds(from) + ") AND " +
+		expr + " < FROM_UNIXTIME(" + unixSeconds(to) + "))", nil
+}
+
+func unixSeconds(t time.Time) string {
+	// value.Time truncates to microseconds; preserve that precision so a
+	// boundary event is not skipped by rounding.
+	return strconv.FormatFloat(float64(t.UTC().UnixMicro())/1e6, 'f', -1, 64)
 }
 
 // OpenSearch SQL on this endpoint has no FILTER (WHERE ...) aggregate clause;

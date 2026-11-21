@@ -29,6 +29,14 @@ type Dialect interface {
 	SupportsFilterAgg() bool
 }
 
+// TimeRangeFilterer is implemented by dialects that cannot compare their
+// timestamp column against the generic timestamp literal. For example,
+// CloudWatch Logs Insights SQL exposes @timestamp as a string and silently
+// matches zero rows when it is compared to CAST(<RFC3339> AS TIMESTAMP).
+type TimeRangeFilterer interface {
+	TimeRange(expr string, from, to time.Time) (string, error)
+}
+
 // ForBackend maps a registry backend name to a dialect.
 func ForBackend(name string) (Dialect, bool) {
 	switch strings.ToLower(name) {
@@ -104,15 +112,23 @@ func (e *Emitter) Emit(p *rewrite.Pushdown) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	from, err := e.D.Literal(value.Time(p.From))
-	if err != nil {
-		return "", err
+	if tr, ok := e.D.(TimeRangeFilterer); ok {
+		clause, err := tr.TimeRange(timeExpr, p.From, p.To)
+		if err != nil {
+			return "", err
+		}
+		where = append(where, clause)
+	} else {
+		from, err := e.D.Literal(value.Time(p.From))
+		if err != nil {
+			return "", err
+		}
+		to, err := e.D.Literal(value.Time(p.To))
+		if err != nil {
+			return "", err
+		}
+		where = append(where, timeExpr+" >= "+from, timeExpr+" < "+to)
 	}
-	to, err := e.D.Literal(value.Time(p.To))
-	if err != nil {
-		return "", err
-	}
-	where = append(where, timeExpr+" >= "+from, timeExpr+" < "+to)
 	for _, f := range p.Filters {
 		expr, err := e.Expr(f)
 		if err != nil {

@@ -244,7 +244,11 @@ func TestBindingErrors(t *testing.T) {
 	if _, err := emitFor(t, cat, `SELECT count(*) AS n FROM logs`, "omni-ds", bindingScope([]string{"a"})); !errors.Is(err, rewrite.ErrScopeNotEnforceable) {
 		t.Fatalf("missing data_source binding error = %v", err)
 	}
-	if _, err := emitFor(t, cat, `SELECT count(*) AS n FROM logs`, "ch-attribute", bindingScope([]string{"a"})); err == nil {
-		t.Fatal("attribute binding on ClickHouse unexpectedly succeeded")
+	sqlText, err := emitFor(t, cat, `SELECT count(*) AS n FROM logs`, "ch-attribute", bindingScope([]string{"a"}))
+	if err != nil {
+		t.Fatalf("attribute binding on ClickHouse: %v", err)
+	}
+	if !strings.Contains(sqlText, "attributes['guardian.partition'] IN ('a')") {
+		t.Fatalf("attribute map predicate missing: %s", sqlText)
 	}
 }

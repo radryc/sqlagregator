@@ -72,8 +72,23 @@ func (ClickHouse) TimeBucket(expr, unit string, n int) (string, error) {
 	return fmt.Sprintf("toStartOfInterval(%s, INTERVAL %d %s)", expr, n, strings.ToUpper(u)), nil
 }
 
+// NestedField renders a map subscript, e.g. labels['guardian.partition'].
 func (ClickHouse) NestedField(path []string) (string, error) {
-	return "", fmt.Errorf("clickhouse: attribute partition bindings are only supported by Omni")
+	if len(path) < 2 {
+		return "", fmt.Errorf("clickhouse: attribute path needs a map and at least one key")
+	}
+	var b strings.Builder
+	if simpleIdent(path[0]) {
+		b.WriteString(path[0])
+	} else {
+		b.WriteString(quoteWith(path[0], "`", "`", "`"))
+	}
+	for _, key := range path[1:] {
+		b.WriteByte('[')
+		b.WriteString(singleQuote(key))
+		b.WriteByte(']')
+	}
+	return b.String(), nil
 }
 
 func (ClickHouse) ILike(expr, pattern string) (string, error) {

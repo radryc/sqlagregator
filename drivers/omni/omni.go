@@ -4,6 +4,7 @@ package omni
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -62,6 +63,21 @@ type Driver struct {
 }
 
 var sessionSanitizer = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
+
+// uniqueSessionName appends a process-unique suffix so concurrent routers do
+// not collide on the Omni session name.
+func uniqueSessionName(base string) string {
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	name := sanitizeSessionName(base + "-" + suffix)
+	if len(name) > 128 {
+		name = name[:128]
+	}
+	return name
+}
+
+func sanitizeSessionName(name string) string {
+	return sessionSanitizer.ReplaceAllString(name, "-")
+}
 
 // New loads AWS configuration (unless an API is injected) and returns a driver.
 func New(ctx context.Context, cfg Config) (*Driver, error) {
@@ -164,7 +180,18 @@ func (d *Driver) session(ctx context.Context) (string, error) {
 		SessionName: aws.String(d.sessionName),
 	})
 	if err != nil {
-		return "", fmt.Errorf("omni: start session: %w", err)
+		// Several routers (or a previous process) may use the same session
+		// name. A conflict is not fatal: pick a unique name and retry once.
+		var conflict *types.ConflictException
+		if errors.As(err, &conflict) {
+			d.sessionName = uniqueSessionName(d.sessionName)
+			created, err = d.api.StartTelemetryQuerySession(ctx, &cloudwatchomni.StartTelemetryQuerySessionInput{
+				SessionName: aws.String(d.sessionName),
+			})
+		}
+		if err != nil {
+			return "", fmt.Errorf("omni: start session: %w", err)
+		}
 	}
 	id := aws.ToString(created.SessionId)
 	if id == "" {

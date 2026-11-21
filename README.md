@@ -1,18 +1,20 @@
 # sqlagregator
 
-Federated SQL coordinator for CloudWatch Omni, BigQuery, ClickHouse, and
-MonoFS node-local DuckDB. See [DESIGN.md](./DESIGN.md) for the architecture.
+Federated SQL coordinator for CloudWatch Omni, CloudWatch Logs Insights,
+BigQuery, ClickHouse, and MonoFS node-local DuckDB. See
+[DESIGN.md](./DESIGN.md) for the architecture.
 
-This repository currently contains the M0 scaffold:
+This repository contains the coordinator core and live backend drivers:
 
 - canonical values and types (`internal/value`)
-- live drivers for ClickHouse (HTTP/JSON), BigQuery (REST), and CloudWatch Omni
-  (the `cloudwatchomni` SDK handles CBOR/SigV4), each in its own module
+- live drivers for ClickHouse (HTTP/JSON), BigQuery (REST), CloudWatch Omni
+  (the `cloudwatchomni` SDK handles CBOR/SigV4), and CloudWatch Logs Insights
+  (OpenSearch SQL via `StartQuery`), each in its own module
 - the restricted SQL parser (`internal/sql`, `internal/ast`)
 - the catalog and endpoint registry (`internal/catalog`)
 - endpoint include/exclude resolution with coverage validation (`internal/selector`)
 - binder and two-phase planner (`internal/plan`, `internal/rewrite`)
-- pushdown emitters for DuckDB, ClickHouse, BigQuery, and Omni (`internal/dialect`)
+- pushdown emitters for DuckDB, ClickHouse, BigQuery, Omni, and Logs Insights (`internal/dialect`)
 - pure-Go hash aggregation (`internal/merge`)
 - the coordinator (`internal/execute`)
 - the `sqlag` CLI (`cmd/sqlag`)
@@ -25,8 +27,9 @@ This repository currently contains the M0 scaffold:
 | `.` | core: parser, planner, dialects, merge, execute, `pkg/sqlag` |
 | `drivers/clickhouse` | ClickHouse HTTP driver (stdlib only) |
 | `drivers/bigquery` | BigQuery REST driver |
+| `drivers/cloudwatchlogsinsights` | CloudWatch Logs Insights SQL driver |
 | `drivers/omni` | CloudWatch Omni driver (AWS SDK) |
-| `cmd/sqlag` | CLI, depends on the core and all drivers |
+| `cmd/sqlag` | CLI, depends on the core and the ClickHouse, BigQuery, and Omni drivers |
 
 The core module does **not** depend on any driver. A host that imports
 `pkg/sqlag` only pulls `gopkg.in/yaml.v3`.
@@ -73,25 +76,37 @@ labelled partial result instead.
 
 ## Execute against a backend
 
+`query` builds a driver for every enabled endpoint in the catalog before it
+selects shards, so the command needs connection flags for every backend the
+catalog declares. `examples/catalog-25.yaml` contains only `duckdb-local`
+endpoints, which the CLI can plan/explain but cannot execute;
+`examples/catalog-multi.yaml` declares Omni, BigQuery, and ClickHouse across
+disjoint time shards.
+
 ```sh
-# ClickHouse
-./sqlag query -config examples/catalog-25.yaml \
+# All three external engines over their time shards
+./sqlag query -config examples/catalog-multi.yaml \
   -clickhouse-url http://localhost:8123 -clickhouse-database strata \
-  -q "SELECT service, count(*) AS n FROM logs WHERE level = 'ERROR' GROUP BY service" \
-  -from 2026-11-01 -to 2026-11-02
-
-# BigQuery
-./sqlag query -config examples/catalog-multi.yaml \
   -bigquery-project my-project -bigquery-location US \
-  -q "SELECT service, count(*) AS n FROM logs GROUP BY service" \
-  -from 2026-11-08 -to 2026-11-15
-
-# CloudWatch Omni (AWS credentials via the default chain)
-./sqlag query -config examples/catalog-multi.yaml \
   -omni-region us-east-1 \
   -q "SELECT service, count(*) AS n FROM logs GROUP BY service" \
-  -from 2026-11-01 -to 2026-11-08
+  -from 2026-11-01 -to 2026-11-22
 ```
+
+For one engine in isolation, point `-config` at a catalog that declares only
+that endpoint (AWS credentials for Omni come from the default chain).
+
+## Driver behavior
+
+- **CloudWatch Omni**: starts one telemetry query session per driver. If the
+  session name is already in use (for example two routers share an endpoint),
+  the driver appends a process-unique suffix and retries once instead of failing
+  the query.
+- **CloudWatch Logs Insights**: emits the time window with `FROM_UNIXTIME(...)`
+  because `@timestamp` is a string; the generic `CAST(<RFC3339> AS TIMESTAMP)`
+  literal matches zero rows.
+- **ClickHouse**: attribute bindings render as map subscripts
+  (``attributes['guardian.partition']``), matching Omni's attribute predicate.
 
 ## MonoFS integration
 

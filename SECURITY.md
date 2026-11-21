@@ -88,10 +88,15 @@ The token crosses the network: use TLS/mTLS between the router and nodes
 
 ## Remote engines
 
-- **ClickHouse:** the coordinator injects the partition predicate when the
-  logical table has a `partition` column; otherwise a restricted query is
-  refused unless the endpoint declares `enforces_partition_scope`.
+- **ClickHouse:** the coordinator injects the partition predicate (a column or
+  an `attributes[...]` map binding) when the endpoint declares one; otherwise a
+  restricted query is refused unless the endpoint declares
+  `enforces_partition_scope`.
 - **BigQuery:** same rule; the partition filter is injected into the query.
+- **CloudWatch Logs Insights:** the placement's log-group list is the scope
+  boundary; the emitted `logGroups(...)` source is built from the placement,
+  never from the request. A `fixed` binding validates that the visible
+  partitions are a subset of the placement's values.
 - **Omni:** schemaless. If the catalog cannot map a trustworthy partition
   field, restricted queries fail with `scope_not_enforceable`. Use one Omni
   space per tenant, or map a real partition field. Unrestricted calls still use

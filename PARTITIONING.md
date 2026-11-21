@@ -1,6 +1,6 @@
 # Partitioning and policy for federated SQL
 
-Status: proposal (background)
+Status: background (implementation status in `PARTITION-POLICY.md`)
 Scope: how a user's visible partitions become a predicate on every backend,
 including CloudWatch Omni when it is a centralized, schemaless store.
 
@@ -59,7 +59,7 @@ Evaluation today:
 - `aws_bindings` maps an AWS record's account/region to a partition
   (`Policy.PartitionForAWS`); it is used for federated record attribution, not
   yet for SQL predicates.
-- The router's new `querySQLScope` uses `VisiblePartitions` + `CanReadSignal`,
+- The router's `querySQLScope` uses `VisiblePartitions` + `CanReadSQL`,
   fails closed, and intersects any restriction forwarded by Doctor.
 
 ## 2. Where partition identity lives in telemetry
@@ -82,10 +82,10 @@ environment injection already writes the partition into the workload:
 
 ```go
 // guardian/internal/pusher/driverutil/otelenv.go
-setGenerated("service.namespace", in.PartitionName)
-setGenerated("guardian.partition", in.PartitionName)
-setGenerated("guardian.intent", in.IntentName)
-setGenerated("guardian.asset", in.Asset.Name)
+force("service.namespace", in.PartitionName)
+force("guardian.partition", in.PartitionName)
+force("guardian.intent", in.IntentName)
+force("guardian.asset", in.Asset.Name)
 ...
 env["OTEL_RESOURCE_ATTRIBUTES"] = formatOtelResourceAttrs(attrs)
 ```
@@ -328,9 +328,8 @@ users:
 ```
 
 Evaluation: `VisibleSQLPartitions = VisiblePartitions ∩ SQL`, and `deny: [sql]`
-blocks the surface wholesale. The router's `querySQLScope` switches from
-`CanReadSignal` to `CanReadSQL`; `QueryLogs`/`QueryTraces` keep their current
-scopes.
+blocks the surface wholesale. The router's `querySQLScope` uses `CanReadSQL`;
+`QueryLogs`/`QueryTraces` keep their current scopes.
 
 ### 5.2 Generic partition bindings
 

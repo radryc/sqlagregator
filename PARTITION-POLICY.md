@@ -1,8 +1,8 @@
-# Partition definition, shard routing, and limits — proposal
+# Partition definition, shard routing, and limits
 
 Status: **Phases 1–5 implemented** (policy/compiler, bindings/predicates,
 shard routing, Omni placement + ingestion hardening, CloudWatch Logs Insights
-SQL). All four federated log backends (Omni, Logs Insights, BigQuery,
+SQL). The federated log backends (Omni, Logs Insights, BigQuery, ClickHouse,
 `monofs_local`) have resolvers, and the divisions demo exercises them per user.
 Related: `PARTITIONING.md` for how the partition attribute travels through
 ingestion; `PARTITION-POLICY.md` supersedes its routing/limit sections.
@@ -325,8 +325,13 @@ gcp-prod fails → no replica → coverage gap
 | CloudWatch Logs Insights | yes | no | no | OpenSearch SQL | SUM/COUNT/MIN/MAX/AVG | 50 log groups, Standard class |
 | CloudWatch Metrics | no | no | yes | PromQL | n/a | not part of SQL |
 | BigQuery | yes | yes | yes | GoogleSQL | yes | bytes billed |
-| ClickHouse | yes | yes | yes | ClickHouse SQL | yes | shared/local |
+| ClickHouse | yes | yes | yes | ClickHouse SQL | yes | shared/local; attribute bindings become map subscripts |
 | MonoFS local | yes | yes | yes | DuckDB SQL | yes | Parquet chunks |
+
+Attribute bindings are backend-specific. ClickHouse renders
+`["attributes", "guardian.partition"]` as ``attributes['guardian.partition']``;
+this is the same partition predicate Omni expresses with its attribute syntax,
+so a shared ClickHouse placement can scope rows per partition.
 
 ### CloudWatch Logs Insights is OpenSearch SQL
 
@@ -342,7 +347,10 @@ Insights QL translator:
 
 `HAVING`, final `ORDER BY`, and `LIMIT`/`OFFSET` stay local. The log group set
 is the shard's boundary, so no extra partition predicate is needed
-(`enforces_partition_scope=true` by construction).
+(`enforces_partition_scope=true` by construction). The time window is emitted
+as `` `@timestamp` >= FROM_UNIXTIME(<seconds>) ``: `@timestamp` is a string in
+Logs Insights SQL, and comparing it to a `CAST(<RFC3339> AS TIMESTAMP)` literal
+silently matches zero rows even though the query reports `Complete`.
 
 Restrictions: Standard Log Class only; up to 50 log groups; one JOIN per
 SELECT; one level of nested subqueries; no multi-statement; case-only field
@@ -541,12 +549,12 @@ Implemented in `monofs/pkg/authz/policy`:
 - Tests: defaults/template merge, partition validation, shard selector
   semantics, SQL grant compilation, quota fields.
 
-Not yet wired:
+Not wired at the end of Phase 1 (closed by the later phases below):
 
-- The router still uses the legacy endpoint selection; `Bundle.Partitions` is
+- The router still used the legacy endpoint selection; `Bundle.Partitions` was
   compiled but not consumed.
-- `pkg/sqlag` does not yet receive `PartitionBinding` or `Scope.Bindings`.
-- No Logs Insights driver yet.
+- `pkg/sqlag` did not yet receive `PartitionBinding` or `Scope.Bindings`.
+- There was no Logs Insights driver (added in Phase 5).
 
 ### Phase 2 (bindings/predicates) — implemented
 
@@ -556,7 +564,8 @@ Not yet wired:
   `pkg/sqlag`.
 - `Dialect.NestedField` (Omni paths such as
   `attributes['guardian.partition']` and
-  `resource['attributes']['guardian.partition']`).
+  `resource['attributes']['guardian.partition']`, and the equivalent
+  ClickHouse map subscripts).
 - `rewrite.PartitionFilter` + emitter for `column`, `attribute`,
   `account_region`, `data_source`, `log_group`, and `fixed`.
 - `rewrite.ErrScopeNotEnforceable`; missing bindings and fixed-subset
@@ -590,9 +599,9 @@ has no account/region because `account_region` bindings need them.
 - Tests: 4-shard mixed-backend merge, shard include selectors, backend
   allowlists, replica fallback, and the full router `QuerySQL` path.
 
-Not wired yet: production resolvers for Omni/Logs Insights/BigQuery/ClickHouse
-and the expansion of a `monofs_local` shard into node endpoints. Those are the
-next backend-integration steps.
+Not wired at the end of Phase 3 (closed by Phases 4–5): production resolvers for
+Omni/Logs Insights/BigQuery/ClickHouse and the expansion of a `monofs_local`
+shard into node endpoints. Those were the next backend-integration steps.
 
 Corrected constraint: one Omni space may hold data from multiple accounts and/or
 regions; the single-space validation was removed. Scope it with
@@ -616,9 +625,10 @@ regions; the single-space validation was removed. Scope it with
   partition overwritten in both OTel env builders, AWS collector config
   contains the partition upsert.
 
-Not wired yet: resolvers for ClickHouse/BigQuery/Logs Insights, expansion of a
-`monofs_local` shard into node endpoints, per-shard log-group headers and
-CloudWatch OTLP exporters, and runtime (post-failure) replica retry.
+Closed in Phase 5: resolvers for ClickHouse/BigQuery/Logs Insights and the
+expansion of a `monofs_local` shard into node endpoints. Still open: per-shard
+log-group headers and CloudWatch OTLP exporters, and runtime (post-failure)
+replica retry.
 
 ### Phase 5 (CloudWatch Logs Insights SQL) — implemented
 
@@ -656,6 +666,9 @@ CloudWatch OTLP exporters, and runtime (post-failure) replica retry.
 
 Remaining gaps:
 - Cross-dialect **runtime** replica retry (preflight fallback is implemented).
+- The generated AWS collector still sends logs only to CloudWatch Logs and
+  traces only to X-Ray; per-shard `x-aws-log-group` headers and OTLP
+  log/trace exporters are not generated.
 - Live quotas (`max_rows`/`max_bytes_scanned`) are still only encoded, not
   enforced per query.
 - `expressions`/`indexed_fields` are accepted by the policy schema but not

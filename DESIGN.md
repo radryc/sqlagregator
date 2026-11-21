@@ -1,8 +1,8 @@
 # Federated SQL Coordinator — Design
 
-**Status:** Draft for review
+**Status:** Implemented through v1 (see §14.1 for remaining gaps)
 **Module:** `github.com/radryc/sqlagregator`
-**Scope:** One generic SQL surface over three independent engines (CloudWatch Omni, BigQuery, ClickHouse), with correct two-phase aggregation and an in-memory merge engine.
+**Scope:** One generic SQL surface over CloudWatch Omni, CloudWatch Logs Insights, BigQuery, ClickHouse, and MonoFS node-local DuckDB, with correct two-phase aggregation and an in-memory merge engine.
 
 ---
 
@@ -111,7 +111,7 @@ Fix or drop:
 9. **`NULL` ordering defaults differ** (BigQuery `NULLS FIRST` for ASC, ClickHouse different again). Emitters must always spell out `NULLS FIRST`/`NULLS LAST`.
 10. **Group-key types differ.** `1` (BigQuery `INT64`), `1` (ClickHouse `UInt64`), `"1"` (Omni string) must not become three groups. The catalog assigns a canonical type and the emitter casts.
 11. **`SUM` of floats is order-dependent across engines.** Compensated summation plus a documented non-determinism note.
-12. **The three-engine assumption itself** (§2).
+12. **The shard/engine topology assumption itself** (§2).
 
 ---
 
@@ -663,15 +663,16 @@ sqlagregator/
   drivers/
     clickhouse/go.mod            # stdlib-only driver module
     bigquery/go.mod              # BigQuery REST driver module
+    cloudwatchlogsinsights/go.mod # CloudWatch Logs Insights SQL driver module
     omni/go.mod                  # CloudWatch Omni driver module
-  cmd/sqlag/go.mod               # CLI module (core + all drivers)
+  cmd/sqlag/go.mod               # CLI module (core + ClickHouse/BigQuery/Omni drivers)
   go.work                        # local workspace across the modules
   internal/
     sql/                         # lexer, parser, ast, errors
     plan/                        # binder, logical plan, validate, explain
     catalog/                     # tables, columns, bindings, coverage, endpoint registry
     selector/                    # endpoint include/exclude resolution + coverage validation
-    dialect/                     # interface + generic/bigquery/clickhouse/omni/duckdb
+    dialect/                     # interface + generic/bigquery/clickhouse/omni/cloudwatchlogsinsights/duckdb
     rewrite/                     # pushdown split, aggregate registry, top-N
     execute/                     # coordinator, scatter/gather, retry, circuit, budgets
     # drivers live in ../../drivers/* as separate modules
@@ -689,7 +690,7 @@ sqlagregator/
 
 Dependencies (core): `gopkg.in/yaml.v3` only.
 
-**Drivers are separate modules:** `drivers/clickhouse` (stdlib), `drivers/bigquery` (`google.golang.org/api`), `drivers/omni` (AWS SDK), and `cmd/sqlag`. A host importing `pkg/sqlag` does not inherit any driver requirement; this is why MonoFS's AWS SDK stays at its original v1.41.5. Arrow/DuckDB remain optional and unimported.
+**Drivers are separate modules:** `drivers/clickhouse` (stdlib), `drivers/bigquery` (`google.golang.org/api`), `drivers/omni` (AWS SDK), `drivers/cloudwatchlogsinsights` (AWS SDK), and `cmd/sqlag`. A host importing `pkg/sqlag` does not inherit any driver requirement; MonoFS imports the drivers it needs (AWS SDK v1.48.0). Arrow/DuckDB remain optional and unimported.
 
 Keep drivers in their own optional modules if the SDK weight becomes a problem: the core must not depend on the AWS or GCP SDKs.
 
@@ -702,13 +703,13 @@ Implemented and tested:
 - `internal/catalog` YAML registry: tables, columns, endpoint roles, coverage groups, capability inheritance.
 - `internal/selector` include/exclude/treat-as-replica resolution, hash and time coverage, overlap detection, `min_coverage`, hard `max`, exclusion reasons.
 - `internal/plan` binder: types, aggregate decomposition, implicit/rejected group keys, HAVING/ORDER BY alias rewriting.
-- `internal/rewrite` + `internal/dialect` pushdown builders and emitters for DuckDB, ClickHouse, BigQuery, Omni.
+- `internal/rewrite` + `internal/dialect` pushdown builders and emitters for DuckDB, ClickHouse, BigQuery, Omni, and Logs Insights.
 - `internal/merge` pure-Go hash aggregation (count/sum/avg/min/max), HAVING, sorting, offset/limit, row mode, global aggregates with no rows, compensated float sums.
 - `internal/execute` coordinator: parse → bind → resolve → emit → scatter → merge, with coverage-aware partial results.
-- live drivers: ClickHouse (HTTP/JSON, typed decoding), BigQuery (REST `jobs.query` + paging), CloudWatch Omni (`cloudwatchomni` SDK, session + polling + paging).
+- live drivers: ClickHouse (HTTP/JSON, typed decoding), BigQuery (REST `jobs.query` + paging), CloudWatch Omni (`cloudwatchomni` SDK, session + polling + paging), and CloudWatch Logs Insights (OpenSearch SQL, polling + typed rows).
 - `pkg/sqlag`: the stable public surface consumed by MonoFS.
 - `cmd/sqlag` `backends`, `explain`, and `query` against a real catalog (`examples/`).
-- multi-module layout: core (`pkg/sqlag`) + `drivers/{clickhouse,bigquery,omni}` + `cmd/sqlag`, with `go.work` and `make test`.
+- multi-module layout: core (`pkg/sqlag`) + `drivers/{clickhouse,bigquery,omni,cloudwatchlogsinsights}` + `cmd/sqlag`, with `go.work` and `make test`.
 - MonoFS RPC integration: `QuerySQL` (router) + `QueryPartial` (node), typed partial rows, truncation as an error.
 - SQL authorization hardening: fail-closed router scope, internal-token-only node SQL RPCs, 403 mapping in Doctor (`SECURITY.md`).
 
@@ -718,7 +719,7 @@ Explicitly not wired yet (next milestones):
   until the replica/coverage mapping is finished);
 - `COUNT(DISTINCT)` and `APPROX_COUNT_DISTINCT`;
 - top-N pushdown, spill, and the Arrow/DuckDB local engine;
-- the MonoFS `QuerySQL`/`QueryPartial` RPCs and the Doctor `shadow` flag (§16).
+- the Doctor `shadow` flag (§16).
 
 ---
 
@@ -916,7 +917,8 @@ If you prefer Doctor-resident, the library works there too — but it then needs
 
 ### 16.3 New RPC surface
 
-**Implemented in v1:** `QuerySQL` on the router (local Parquet shards only),
+**Implemented in v1:** `QuerySQL` on the router (local Parquet shards, and
+policy-routed placements when the compiled bundle defines partitions),
 `QueryPartial` on nodes, typed partial results (`types[]`), and truncation as
 an error instead of a silent cut. Shared ClickHouse mode is rejected with
 `Unimplemented` so replica data is never summed.
@@ -988,6 +990,7 @@ message QueryPartialResponse {
 | `clickhouse` | ClickHouse SQL over the same views, `FORMAT JSON`, read-only | view-enforced, unchanged |
 | `omni` | explicit columns, explicit `CAST`s, mandatory `@timestamp` bound | coordinator-injected; endpoint must declare `enforces_partition_scope=true` or the query is refused |
 | `bigquery` | fully-qualified table, partition filter | coordinator-injected; same capability requirement |
+| `cloudwatch_logs_insights` | OpenSearch SQL over a `logGroups(...)` source | log-group source (or a `fixed` partition) |
 
 **SQL authorization is fail-closed.** `QuerySQL` and `QueryDuckDBSQL` call
 `querySQLScope`, which computes visible partitions even when read enforcement is

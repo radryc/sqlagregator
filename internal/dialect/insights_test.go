@@ -3,6 +3,7 @@ package dialect_test
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/radryc/sqlagregator/internal/catalog"
 	"github.com/radryc/sqlagregator/internal/dialect"
@@ -54,18 +55,35 @@ func TestInsightsSQLDialect(t *testing.T) {
 		"CAST(`service` AS STRING) AS `k0`",
 		"SUM(CASE WHEN (`level` = 'ERROR') THEN 1 ELSE 0 END) AS `p0`",
 		"SUM(CAST(`latency` AS LONG)) AS `p1`",
-		"`@timestamp` >= CAST('",
+		"`@timestamp` >= FROM_UNIXTIME(",
+		"`@timestamp` < FROM_UNIXTIME(",
 		"GROUP BY CAST(`service` AS STRING)",
 	} {
 		if !strings.Contains(sqlText, want) {
 			t.Fatalf("SQL missing %q\n%s", want, sqlText)
 		}
 	}
+	if strings.Contains(sqlText, "`@timestamp` >= CAST('") {
+		t.Fatalf("Insights @timestamp must not be compared to a CAST literal: %s", sqlText)
+	}
 	if strings.Contains(sqlText, " FILTER ") {
 		t.Fatalf("Insights SQL must not use FILTER: %s", sqlText)
 	}
 	if strings.Contains(sqlText, "HAVING") || strings.Contains(sqlText, "LIMIT") {
 		t.Fatalf("pushdown must not finalize HAVING/LIMIT: %s", sqlText)
+	}
+}
+
+func TestInsightsTimeRangeUsesUnixTime(t *testing.T) {
+	from := time.Date(2026, 11, 20, 12, 0, 0, 123456000, time.UTC)
+	to := time.Date(2026, 11, 20, 13, 0, 0, 654321000, time.UTC)
+	clause, err := (dialect.CloudWatchLogsInsights{}).TimeRange("`@timestamp`", from, to)
+	if err != nil {
+		t.Fatalf("time range: %v", err)
+	}
+	want := "(`@timestamp` >= FROM_UNIXTIME(1795176000.123456) AND `@timestamp` < FROM_UNIXTIME(1795179600.654321))"
+	if clause != want {
+		t.Fatalf("time range = %q, want %q", clause, want)
 	}
 }
 
