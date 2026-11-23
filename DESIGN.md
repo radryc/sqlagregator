@@ -120,7 +120,7 @@ Fix or drop:
 ```text
                     ┌──────────────────────────────────────────────┐
   SQL text  ───────▶│ Frontend: lexer → parser → AST                │
-  QuerySpec ───────▶│ (structured JSON front door, same AST)       │
+  QuerySpec ───────▶│ (target: structured JSON front door, same AST)│
                     └──────────────────┬───────────────────────────┘
                                        ▼
                     ┌──────────────────────────────────────────────┐
@@ -178,10 +178,8 @@ FROM   table [AS alias]
 
 select_list := select_item (',' select_item)*
 select_item := expr [AS alias] | aggregate_call [AS alias]
-aggregate   := COUNT(*) | COUNT([DISTINCT] expr)
+aggregate   := COUNT(*) | COUNT(expr)
              | SUM(expr) | MIN(expr) | MAX(expr) | AVG(expr)
-             | STDDEV(expr) | STDDEV_POP(expr) | VAR_SAMP(expr) | VAR_POP(expr)
-             | APPROX_COUNT_DISTINCT(expr)
 expr        := column | literal | CAST(expr AS type) | func(expr, ...)
              | expr (('+'|'-'|'*'|'/') expr)
              | time_bucket(unit, ts) | date_trunc(unit, ts)
@@ -196,23 +194,31 @@ expr        := column | literal | CAST(expr AS type) | func(expr, ...)
 
 Deliberately **out of v1**: joins, subqueries, CTEs, set operations, window functions, `QUALIFY`, `TABLESAMPLE`, arrays/structs, `GROUP BY` positions, `ORDER BY` ordinals, `HAVING` on non-aggregates.
 
+**Shipped aggregate set is exactly `count`, `sum`, `min`, `max`, and `avg`**
+(`internal/plan/plan.go:252-325`). `COUNT(DISTINCT …)`,
+`APPROX_COUNT_DISTINCT`, `STDDEV*`, and `VAR*` are recognised as aggregate
+names but rejected with `supported aggregates: count, sum, min, max, avg`;
+the D7 sketch design and the M3 milestone below remain target work.
+
 Rejections are structured and actionable:
 
 ```go
-type UnsupportedError struct {
-    Clause     string // "JOIN"
-    Reason     string // "cross-engine joins are not decomposable"
-    Suggestion string // "run with mode=passthrough and target=clickhouse"
+// internal/sql/lexer.go:32
+type Error struct {
     Pos        int
+    Msg        string // "cross-engine joins are not decomposable"
+    Clause     string // "JOIN"
+    Suggestion string // "use passthrough mode for expressions, ..."
 }
 ```
 
-Two front doors, one IR:
+The design described two front doors producing one IR. Only the first ships:
 
-1. **SQL text** for humans and Grafana-style callers.
-2. **`QuerySpec` JSON** (table, filters, group-by, aggregates, order, limit) for generated/LLM-produced queries and for callers that should not need a parser.
-
-Both produce the same `ast.Select`, so there is exactly one binder and one planner.
+1. **SQL text** (implemented) for humans, Grafana-style callers, and the
+   `sqlag` CLI.
+2. **`QuerySpec` JSON** (table, filters, group-by, aggregates, order, limit)
+   remains target design; there is no `QuerySpec` type or JSON query front door
+   in the code.
 
 ---
 
@@ -385,6 +391,11 @@ Emit the request's `from`/`to` as literals in every backend's native form, and *
 
 Every supported aggregate declares its partial form and merge rule. The rewriter consults this table; anything absent forces passthrough.
 
+**Shipped:** only the `COUNT`, `SUM`, `MIN`, `MAX`, and `AVG` rows. The
+`COUNT(DISTINCT)`, `APPROX_COUNT_DISTINCT`, `STDDEV`/`VAR`, `STRING_AGG`, and
+`percentile` rows are target design; the binder rejects them today
+(`internal/plan/plan.go:252-325`).
+
 | User expression | Pushdown projection | Merge operation | Notes |
 |---|---|---|---|
 | `COUNT(*)` | `COUNT(*) AS c0` | `sum(c0)` | |
@@ -525,46 +536,53 @@ Each driver (`omni`, `bigquery`, `clickhouse`) implements exactly this and is re
 
 ## 11. Execution model and resilience
 
-```go
-type Options struct {
-    Deadline      time.Duration // coordinator budget, default 20s (matches Doctor)
-    PerEngine     time.Duration // default 15s
-    MaxRows       int           // default 50k
-    MaxGroups     int           // default 1M
-    MaxBytes      int64         // default 256 MiB in flight
-    AllowPartial  bool          // default false
-    MaxConcurrent int           // default 3 (one per backend)
-}
-```
+**Shipped model** (`internal/execute/execute.go:175-260`):
 
-- **Scatter/gather**: `errgroup.WithContext`, one goroutine per selected backend, bounded by a semaphore. First error cancels the rest unless `AllowPartial`.
-- **Backpressure**: streams are consumed as they arrive; batches are size-capped (e.g. 8k rows) so one engine cannot pin memory.
-- **Retries**: only idempotent reads, only on 429/5xx/connection reset, at most twice, jittered, honouring `Retry-After`. Never retry a query that already streamed rows into the aggregator (dual delivery would double-count) — restart the whole gather into a fresh aggregator instead.
-- **Circuit breaker** per backend, keyed by target: Omni throttling must not turn every query into a 15s timeout.
-- **Health-aware replica selection** (§2), not round-robin.
-- **Result cache**: off by default. A plan cache keyed by `(normalized SQL, catalog version, from/to)` is fine; caching data rows is not, because telemetry is time-sensitive.
+- **Scatter/gather**: one goroutine per emitted pushdown, guarded by a
+  semaphore sized to the number of selected endpoints. The first error cancels
+  the remaining backend calls unless `AllowPartial` is set.
+- **Streams**: each driver returns a complete typed `Stream`; the coordinator
+  sorts streams by endpoint ID and hands them to the merge engine.
+- **No retries and no circuit breaker.** `internal/execute` contains no retry,
+  backoff, `Retry-After` handling, health-aware replica selection, or
+  per-backend circuit state. A backend error is terminal for that query.
+- **No coordinator-level budgets or backpressure.** There is no deadline,
+  row, group, or byte cap in `internal/execute`, and no result or plan cache;
+  only the per-driver caps apply (Omni 200k rows, Logs Insights 10k).
+- **Replicas**: the selector classifies replicas and can return them in
+  `Resolution.Replicas`, but `execute` only queries `Resolution.Shards`.
+  A failed shard is not failed over inside the coordinator.
 
-Failure policy:
+Failure policy as implemented:
 
 | Scenario | Default | `allow_partial=true` |
 |---|---|---|
-| One shard errors/timeouts | error | result + `coverage.complete=false`, `missing=[engine]` |
-| One replica errors | fail over to a replica | same |
+| One shard errors/timeouts | error (first error) | result + `coverage.complete=false`, failed IDs in `coverage.missing_endpoints`, per-backend `error` |
+| One replica errors | not executed (no coordinator failover) | same |
 | All shards for a group fail | error | error (nothing to merge) |
-| Type/precision loss | result + warning | same |
-| Group/row budget exceeded | `RESOURCE_EXHAUSTED` | same (never silently truncate groups) |
+| Type/precision loss | result + warning, driver-dependent | same |
+| Group/row budget exceeded | not enforced | not enforced |
 
 Response metadata is part of the contract:
 
 ```go
 type Result struct {
-    Columns  []ColumnMeta
-    Batches  []Batch
-    Backends []BackendStats   // rows, bytes, latency, retries, pages
-    Coverage CoverageInfo     // expected, answered, missing, complete
-    Warnings []Warning        // precision_loss, unstable_paging, float_sum, ...
+    Columns  []string
+    Rows     [][]any
+    RowCount int
+    Coverage CoverageInfo   // complete, covered, gaps, missing_endpoints, groups
+    Backends []BackendStats // id, backend, rows, duration_ms, error
+    Excluded []Exclusion    // every endpoint not selected, with a reason
+    Warnings []string
+    Partial  bool           // !Coverage.Complete
+    Mode     string         // "passthrough" | "federated"
 }
 ```
+
+**Target, not implemented:** a coordinator `Options`/deadline budget,
+per-engine timeouts, a bounded batch pipeline, retry with jitter, a per-backend
+circuit breaker, health-aware replica failover, result/plan caching, and a hard
+`RESOURCE_EXHAUSTED` row/group/byte cap.
 
 ---
 
@@ -617,40 +635,55 @@ Recommendation: **library first**, sidecar second. The Doctor `/v1/sql/query` en
 
 ## 13. Public API
 
+Shipped (`pkg/sqlag/sqlag.go:153-244`, `internal/execute/execute.go:22-66`):
+
 ```go
 package sqlag
 
 type Coordinator struct{ /* ... */ }
 
-func New(cfg Config) (*Coordinator, error)
+func New(cat *Catalog) *Coordinator
+func (c *Coordinator) Register(b Backend)
 
 func (c *Coordinator) Query(ctx context.Context, req Request) (*Result, error)
 func (c *Coordinator) Explain(ctx context.Context, req Request) (*Explanation, error)
-func (c *Coordinator) QuerySpec(ctx context.Context, spec QuerySpec) (*Result, error)
+
+type Backend interface {
+    ID() string
+    Query(ctx context.Context, req PartialRequest) (*Stream, error)
+}
+
+type Scope struct {
+    Restricted bool
+    Partitions []string
+    Bindings   []PartitionBindingValue
+}
 
 type Request struct {
     SQL          string
-    From, To     time.Time       // required; default 1h if zero
+    From, To     time.Time    // default: last hour ending now
     Limit        int
-    Mode         Mode            // auto | federated | passthrough
-    Target       string          // for passthrough
-    Backends     Selector        // include / exclude / treat_as_replica (§15)
+    Selector     Selector     // include / exclude / treat_as_replica (§15)
     AllowPartial bool
+    Scope        Scope        // authorization + optional partition bindings
 }
 ```
 
-HTTP (mirrors Doctor's console):
+`Register` takes a `Backend`, so the host owns driver construction and
+credentials. The execution mode is derived, not requested: `passthrough` when
+exactly one pushdown is emitted, `federated` otherwise
+(`internal/execute/execute.go:395-399`). `Explain` returns the mode, selected
+and excluded endpoints, coverage, emitted SQL per placement, and the merge
+plan.
 
-```text
-POST /v1/sql            { query, from, to, limit, mode, target, backends, allow_partial }
-POST /v1/sql/explain    → { mode, selected[], excluded[{id,reason}], coverage, pushdown_sql[], merge_plan }
-POST /v1/query          { spec: QuerySpec, from, to, backends, ... }
-GET  /v1/sql/backends   → endpoint registry with role, tags, coverage group, selected_by_default
-GET  /healthz           → per-backend health, circuit state, queue depth
-GET  /metrics           → Prometheus: queries, partials, per-backend latency, rows, pages
-```
+There is **no** `New(Config)`, `QuerySpec`, request-level `Mode`/`Target`, or
+`Backends` field, and no coordinator HTTP server or `internal/api` package.
+Those were design proposals.
 
-`/v1/sql` returns `200` with `coverage.complete=false` only when `allow_partial=true`; otherwise a failed shard is `502`/`503` with the failing backend named.
+**Target, not implemented:** a `QuerySpec` JSON front door and an HTTP surface
+(`POST /v1/sql`, `POST /v1/sql/explain`, `GET /v1/sql/backends`, `GET /healthz`,
+`GET /metrics`). Today the host-facing entry points are the Go API and the
+`sqlag` CLI.
 
 ---
 
@@ -659,7 +692,7 @@ GET  /metrics           → Prometheus: queries, partials, per-backend latency, 
 ```text
 sqlagregator/
   go.mod                         # core module (yaml only)
-  pkg/sqlag/                     # public API consumed by hosts
+  pkg/sqlag/                     # public Go API consumed by hosts
   drivers/
     clickhouse/go.mod            # stdlib-only driver module
     bigquery/go.mod              # BigQuery REST driver module
@@ -670,23 +703,20 @@ sqlagregator/
   internal/
     sql/                         # lexer, parser, ast, errors
     plan/                        # binder, logical plan, validate, explain
-    catalog/                     # tables, columns, bindings, coverage, endpoint registry
+    catalog/                     # tables, columns, partition bindings, coverage, endpoints
     selector/                    # endpoint include/exclude resolution + coverage validation
     dialect/                     # interface + generic/bigquery/clickhouse/omni/cloudwatchlogsinsights/duckdb
-    rewrite/                     # pushdown split, aggregate registry, top-N
-    execute/                     # coordinator, scatter/gather, retry, circuit, budgets
+    rewrite/                     # pushdown split, aggregate registry, partition predicates
+    execute/                     # coordinator, scatter/gather, partial results
     # drivers live in ../../drivers/* as separate modules
     value/                       # canonical types, decimals, coercion, compare, hash
-    merge/                       # goagg, having, sort, limit, hll
-    local/duckdbsql/             # //go:build cgo && duckdb
-    local/arrowbatch/            # shared batch helpers
-    api/                         # HTTP/gRPC, auth, scope
-  pkg/sqlag/                     # public Go API
-  testdata/
-    corpus/                      # golden SQL per dialect
-    fixtures/                    # Parquet/CSV for differential tests
+    merge/                       # goagg, having, sort, limit
+  examples/                      # catalog-25.yaml, catalog-multi.yaml
   DESIGN.md
 ```
+
+No `internal/api`, `internal/local`, or `testdata/` tree exists today; the
+DuckDB/Arrow local engine and the HTTP surface are target design (§12, §13).
 
 Dependencies (core): `gopkg.in/yaml.v3` only.
 
@@ -715,17 +745,28 @@ Implemented and tested:
 
 Explicitly not wired yet (next milestones):
 
-- federation across **shared ClickHouse** mode (`QuerySQL` returns `Unimplemented`
-  until the replica/coverage mapping is finished);
+- **shared ClickHouse legacy fan-out**: `QuerySQL` returns `Unimplemented`
+  when telemetry reads are shared and no partition bundle is compiled.
+  Policy-routed placements are supported;
+- cross-dialect **runtime** replica failover inside the coordinator (preflight
+  replica selection lives in `sqlfederation.Route`);
 - `COUNT(DISTINCT)` and `APPROX_COUNT_DISTINCT`;
+- `STDDEV*` / `VAR*`;
 - top-N pushdown, spill, and the Arrow/DuckDB local engine;
-- the Doctor `shadow` flag (§16).
+- coordinator budgets, retry, circuit breaker, and metrics (§11);
+- a Doctor-side federated engine switch. There is no `--sql-engine` or
+  `shadow` flag; Doctor still calls `QueryDuckDBSQL`.
 
 ---
 
 ## 15. Endpoint selection and exclusion API
 
 A deployment can register many endpoints (25, 100, …) while only a subset are true disjoint shards; the rest may be replicas, duplicates, or migration leftovers. Selecting the execution set is therefore a first-class, auditable operation — not an afterthought and never a silent default.
+
+Status: the registry, matchers, selector, coverage validation, replica
+classification, `max`, and `min_coverage` are implemented
+(`internal/selector/selector.go`). Health/circuit-based exclusion and the HTTP
+discovery endpoints described below are target design.
 
 ### 15.1 Registry
 
@@ -810,7 +851,7 @@ Matching semantics: within a matcher all specified fields must match (AND); acro
 3. Apply `Include` (intersection), then `Exclude` (subtraction).
 4. Apply the deployment default: replicas are excluded unless `IncludeReplicas`. (Reasons are reported in this order, so an explicit exclusion of a replica reads `request_exclude`, not `replica`.)
 5. Drop endpoints missing a required capability (e.g. Omni for metrics) with reason `missing_capability`.
-6. Drop unhealthy or circuit-open endpoints with reason `unhealthy` — **only if coverage survives**; otherwise fail instead of undercounting.
+6. *(Target)* Drop unhealthy or circuit-open endpoints with reason `unhealthy` — **only if coverage survives**; otherwise fail instead of undercounting. The `unhealthy` reason exists, but the selector receives no health input today.
 7. Split survivors into the **sum set** (`Role=shard`) and the **failover set** (`Role=replica`).
 8. Validate coverage per `CoverageGroup`:
    - overlap between selected shards → `coverage_overlap` (hard error, always)
@@ -855,6 +896,9 @@ Outcomes:
 
 ### 15.5 Discovery and explain
 
+Status: **target HTTP surface**. Today `sqlag backends` and `sqlag explain`
+print the same information to stdout.
+
 ```http
 GET /v1/sql/backends?table=logs
 ```
@@ -873,6 +917,10 @@ GET /v1/sql/backends?table=logs
 `POST /v1/sql/explain` returns the same selection plus `excluded[].reason`, the pushdown SQL for each selected endpoint, and the merge plan. This is the API the operator uses to confirm that 21 endpoints really are excluded for the right reason.
 
 ### 15.6 Precedence and audit
+
+Status: precedence and per-query result metadata (`selected`, `excluded`,
+`coverage`) are implemented. The persistent audit record described here is
+target design; Doctor's `/v1/sql/query` audit path covers the legacy surface.
 
 Precedence is `request > tenant policy > deployment default`. `Include` narrows; `Exclude` subtracts; no request can add an endpoint that tenant policy removed. Every query records `selected[]`, `excluded[{id,reason}]`, `coverage`, `allow_partial`, and `mode` in the audit record. Operationally, the exclusion list is data — not code — so changing which replicas are ignored does not require a deploy.
 
@@ -917,12 +965,13 @@ If you prefer Doctor-resident, the library works there too — but it then needs
 
 ### 16.3 New RPC surface
 
-**Implemented in v1:** `QuerySQL` on the router (local Parquet shards, and
-policy-routed placements when the compiled bundle defines partitions),
-`QueryPartial` on nodes, typed partial results (`types[]`), and truncation as
-an error instead of a silent cut. Shared ClickHouse mode is rejected with
-`Unimplemented` so replica data is never summed.
-
+**Implemented in v1** (`monofs/api/proto/monofs.proto:1710-1758`):
+`QuerySQL` on the router (legacy healthy local shards, and policy-routed
+placements when the compiled bundle defines partitions), `QueryPartial` on
+nodes, and partial results whose typed rows travel inside the JSON body.
+Truncation is an error, not a silent cut. When telemetry reads are shared via
+ClickHouse, the legacy node fan-out returns `Unimplemented` so replicas are
+never summed; the policy path is not affected.
 
 ```proto
 message BackendMatcher {
@@ -952,11 +1001,10 @@ message QuerySQLRequest {
     bool visible_partitions_set = 7;
     BackendSelector backends = 8;
     bool allow_partial = 9;
-    string mode = 10;               // auto | federated | passthrough
 }
 
 message QuerySQLResponse {
-    string result_json = 1;         // columns, rows, coverage, backends, warnings
+    string results_json = 1;        // sqlag.Result JSON: columns, rows, coverage, ...
 }
 
 // Per-node pushdown. Returns typed partial rows, not a user-facing result.
@@ -969,16 +1017,18 @@ message QueryPartialRequest {
     repeated string visible_partitions = 6;
     bool visible_partitions_set = 7;
     repeated string expected_columns = 8;
-    repeated string expected_types = 9;
 }
 
 message QueryPartialResponse {
-    string columns_json = 1;
-    string types_json = 2;
-    string rows_json = 3;           // Arrow IPC later
-    bool truncated = 4;
+    string results_json = 1;        // {columns:[], types:[], rows:[[]], truncated:false}
 }
 ```
+
+There is no `mode` field: the coordinator derives `passthrough`/`federated`
+from the number of emitted pushdowns. Typed rows are not separate protobuf
+fields; `sqlfederation.decodePartial` decodes `columns`, `types`, `rows`, and
+`truncated` from `results_json`
+(`monofs/internal/sqlfederation/federation.go:205-209,249`).
 
 `QueryDuckDBSQL` stays untouched for compatibility. `QuerySQL` is additive.
 
@@ -986,10 +1036,10 @@ message QueryPartialResponse {
 
 | Endpoint | SQL emitted | Scope enforcement |
 |---|---|---|
-| `duckdb-local` (node) | DuckDB SQL over `logs`/`metrics`/`traces` views | view-enforced, unchanged |
-| `clickhouse` | ClickHouse SQL over the same views, `FORMAT JSON`, read-only | view-enforced, unchanged |
-| `omni` | explicit columns, explicit `CAST`s, mandatory `@timestamp` bound | coordinator-injected; endpoint must declare `enforces_partition_scope=true` or the query is refused |
-| `bigquery` | fully-qualified table, partition filter | coordinator-injected; same capability requirement |
+| `monofs_local` / `duckdb-local` | DuckDB SQL over `logs`/`metrics`/`traces` views | view-enforced for legacy nodes; policy placements add a `column` predicate |
+| `clickhouse` | ClickHouse SQL over the dataset view or a placement source, `FORMAT JSON`, read-only | view-enforced or coordinator-injected from the placement's `PartitionBinding` |
+| `omni` | explicit columns, explicit `CAST`s, mandatory `@timestamp` bound | coordinator-injected `log_group` / `attribute` / `account_region` / `data_source` / `fixed` binding; no binding means the legacy logical `partition` column is tried first |
+| `bigquery` | fully-qualified table, partition filter | coordinator-injected, same binding kinds |
 | `cloudwatch_logs_insights` | OpenSearch SQL over a `logGroups(...)` source | log-group source (or a `fixed` partition) |
 
 **SQL authorization is fail-closed.** `QuerySQL` and `QueryDuckDBSQL` call
@@ -1000,20 +1050,48 @@ Nodes additionally require the cluster-internal token on `QueryDuckDBSQL` and
 `QueryPartial`; the router attaches it on every node dial, so a direct node
 caller cannot assert an unrestricted scope. See `SECURITY.md`.
 
-Restricted callers (`QueryScope.Restricted`) may only use endpoints that can enforce the partition predicate. If a restricted query selects Omni/BigQuery without that capability, resolution fails with `scope_not_enforceable` — it does not silently return unfiltered rows.
+Restricted callers (`QueryScope.Restricted`) may only use endpoints that can
+express the partition predicate. The six binding kinds are `column`,
+`attribute`, `account_region`, `data_source`, `log_group`, and `fixed`
+(`internal/rewrite/rewrite.go:143-210`, `internal/dialect/dialect.go:176-238`).
+A missing or unusable binding fails with `scope_not_enforceable` rather than
+returning unfiltered rows.
+
+One legacy path is weaker: when an endpoint has **no** binding but the logical
+table declares a `partition` column, the rewriter uses that column *before*
+checking `enforces_partition_scope` (`internal/rewrite/rewrite.go:146-155`).
+For an Omni endpoint whose logical `partition` maps to a nonexistent physical
+field, a restricted query can therefore emit `"partition" IN (...)` instead of
+being refused. See `SECURITY.md` and the example gap in `PARTITIONING.md` §3.
 
 Generated SQL must pass the node's existing allow-list. That means: single statement, no table functions, dataset view only, no CTE redefinition of the dataset. The emitter already obeys this; the allow-list is the backstop.
 
 ### 16.5 Compatibility and rollout
 
-1. **Add**, don't replace: `QuerySQL` RPC + coordinator in the router; `QueryDuckDBSQL` unchanged.
-2. Doctor flag `--sql-engine=duckdb|federated|shadow`, default `duckdb`.
-3. **Shadow mode**: run both paths, compare exact plans (row counts, group-key sets, sums within a documented tolerance), return the legacy result, emit `sql_shadow_mismatch_total{dataset}`. This is how you earn confidence without risking dashboards.
-4. Flip per tenant/dataset to `federated`. Raw-row queries use row mode; DuckDB-specific SQL falls back to passthrough on `duckdb-local`.
-5. Migrate clients/UI to consume `coverage` + merged rows, then stop returning per-node envelopes.
-6. Delete `sharedTelemetryReads()`; it becomes `role=replica` + `include_replicas=false` in the registry.
+Shipped:
 
-Response compatibility: keep `dataset`, `nodes[]`, `restricted`, `visible_partitions`. In federated mode return one synthetic `nodes[]` entry containing the merged result, plus `coverage`, `backends[]`, `warnings[]`. Old clients keep working; new clients read the metadata.
+1. **Add**, don't replace: `QuerySQL` RPC + coordinator in the router;
+   `QueryDuckDBSQL` unchanged.
+2. The policy path and the legacy node path coexist; a compiled partition
+   bundle selects the former.
+
+Target (not implemented):
+
+3. A Doctor-side engine switch (`--sql-engine=duckdb|federated|shadow`) and
+   **shadow mode**: run both paths, compare plans, return the legacy result,
+   emit `sql_shadow_mismatch_total{dataset}`. Neither the flag nor the metric
+   exists today; Doctor only calls `QueryDuckDBSQL`.
+4. Flip per tenant/dataset to `federated`. Raw-row queries use row mode;
+   DuckDB-specific SQL falls back to passthrough on `monofs_local`.
+5. Migrate clients/UI to consume `coverage` + merged rows, then stop returning
+   per-node envelopes.
+6. Delete `sharedTelemetryReads()`; it becomes `role=replica` +
+   `include_replicas=false` in the registry.
+
+Response compatibility: keep `dataset`, `nodes[]`, `restricted`,
+`visible_partitions`. In federated mode return one synthetic `nodes[]` entry
+containing the merged result, plus `coverage`, `backends[]`, `warnings[]`.
+Old clients keep working; new clients read the metadata.
 
 ### 16.6 Replacing the log engine's query path
 
@@ -1024,7 +1102,10 @@ Response compatibility: keep `dataset`, `nodes[]`, `restricted`, `visible_partit
 
 ### 16.7 Rollback
 
-Flip `--sql-engine=duckdb` on the Doctor side. The legacy RPC path is untouched, so rollback is a flag change, not a redeploy of MonoFS.
+Today rollback means removing the compiled partition bundle (or routing through
+the legacy node path), not flipping a Doctor flag: the `--sql-engine` switch is
+target design only. The legacy `QueryDuckDBSQL` path is untouched, so the
+fallback needs no MonoFS redeploy.
 
 ---
 

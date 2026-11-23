@@ -88,6 +88,12 @@ The token crosses the network: use TLS/mTLS between the router and nodes
 
 ## Remote engines
 
+A restricted query is scoped by the placement's `PartitionBinding`. The six
+kinds are `column`, `attribute`, `account_region`, `data_source`, `log_group`,
+and `fixed`; the coordinator emits the matching predicate and fails with
+`scope_not_enforceable` when the binding cannot express the visible
+partitions.
+
 - **ClickHouse:** the coordinator injects the partition predicate (a column or
   an `attributes[...]` map binding) when the endpoint declares one; otherwise a
   restricted query is refused unless the endpoint declares
@@ -103,6 +109,31 @@ The token crosses the network: use TLS/mTLS between the router and nodes
   whatever the AWS credentials can see.
 - Direct drivers (CLI) never add identity-based restrictions; the credentials
   define the blast radius.
+
+### Legacy partition-column fallback (remaining risk)
+
+The refusal is not absolute. Before consulting `enforces_partition_scope`,
+`buildPartitionFilter` checks whether the **logical table** declares a
+`partition` column and, if so, emits `"partition" IN (...)`
+(`internal/rewrite/rewrite.go:143-155`). It uses the literal identifier
+`partition`; the endpoint's `columns` mapping is not consulted for this
+fallback. This is the pre-binding behaviour kept for compatibility.
+
+- When the backend really has a `partition` column with partition semantics,
+  the fallback is correct and no binding is needed.
+- When the backend is schemaless (Omni) or has no such field, the query is
+  **not refused**. It is emitted with an invalid predicate and fails at the
+  backend, or — worse, if a field named `partition` exists with different
+  semantics — it can match rows outside the caller's visible set.
+- `enforces_partition_scope=true` does not bypass this: the column fallback is
+  tried first.
+
+Mitigation: give every endpoint that can serve restricted SQL an explicit
+`partition:` binding, and never map the logical `partition` column to a
+physical field the backend does not actually use for partitioning.
+`examples/catalog-multi.yaml` currently shows the gap: `omni-prod` has no
+`partition:` binding while the logical table declares `partition`, so the
+legacy fallback applies.
 
 ## Known limitations
 

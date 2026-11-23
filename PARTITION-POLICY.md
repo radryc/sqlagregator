@@ -571,7 +571,10 @@ Not wired at the end of Phase 1 (closed by the later phases below):
 - `rewrite.ErrScopeNotEnforceable`; missing bindings and fixed-subset
   violations fail closed.
 - legacy fallback: an endpoint without a binding still uses the logical
-  `partition` column when present.
+  `partition` column when present. This check runs **before**
+  `enforces_partition_scope`, so an endpoint without a real `partition` field
+  is not refused; the predicate uses the literal `partition` identifier
+  regardless of the `columns` map. See `SECURITY.md`.
 - Tests: logs/traces attributes, account/region pairs, data source, log group,
   fixed subset, column fallback, and error paths.
 
