@@ -111,12 +111,29 @@ that endpoint (AWS credentials for Omni come from the default chain).
 ## MonoFS integration
 
 The core library is `pkg/sqlag`. MonoFS (a separate module) imports it and
-provides the host adapter:
+provides the host adapter in `monofs/internal/sqlfederation` (see DESIGN.md
+§16):
 
-- `QuerySQL` on the router federates across healthy local shards.
+- `QuerySQL` on the router federates a generic SELECT. When the loaded access
+  policy defines partitions, it routes to policy-compiled placements and
+  dispatches each pushdown through `sqlfederation.MultiResolver` to Omni,
+  CloudWatch Logs Insights, BigQuery, ClickHouse, or `monofs_local`
+  (`monofs/cmd/monofs-router/main.go:353-384`,
+  `monofs/internal/router/sql_query.go:35-57`). Only when no partition bundle
+  is compiled does it fall back to the legacy fan-out over healthy local
+  nodes.
+- With shared ClickHouse telemetry reads, that legacy node fan-out returns
+  `Unimplemented`: those nodes are replicas, not disjoint shards. Policy-routed
+  placements are unaffected because the policy names the shard and placement
+  explicitly.
 - `QueryPartial` on each node executes one generated pushdown and returns
-  typed partial rows.
-- The adapter lives in `monofs/internal/sqlfederation` (see DESIGN.md §16).
+  typed partial rows. The column names and canonical types travel inside the
+  JSON body (`columns`, `types`, `rows`); the protobuf response has a single
+  `results_json` field.
+- `cmd/sqlag query` registers drivers only for ClickHouse, BigQuery, and Omni
+  (`cmd/sqlag/main.go:324-374`). A `cloudwatch_logs_insights` endpoint is
+  therefore plan-only in the CLI: `backends` and `explain` accept it, but
+  `query` cannot execute it.
 - SQL is **fail-closed**: the router requires a loaded access policy
   (`--sql-require-policy`, default true) and nodes require the cluster-internal
   token for SQL RPCs. See [SECURITY.md](./SECURITY.md) for the trust model and

@@ -1,6 +1,7 @@
 # Partitioning and policy for federated SQL
 
-Status: background (implementation status in `PARTITION-POLICY.md`)
+Status: background. Partition bindings, predicate emission, and shard routing
+are implemented; `PARTITION-POLICY.md` carries the phase-by-phase status.
 Scope: how a user's visible partitions become a predicate on every backend,
 including CloudWatch Omni when it is a centralized, schemaless store.
 
@@ -180,8 +181,9 @@ attributes in the collector, and prefer SigV4 over long-lived bearer tokens.
 
 ## 3. Omni: the centralized, schemaless case
 
-A single Omni space can receive every tenant's telemetry. Omni has **no schema
-and no partition column**. It does expose these fields:
+Status: **implemented through `PartitionBinding`**. A single Omni space can
+receive every tenant's telemetry. Omni has **no schema and no partition
+column**. It does expose these fields:
 
 - `@timestamp`, `@ingest_time`, `@telemetry_type`
 - `@aws.account`, `@aws.region`
@@ -199,39 +201,50 @@ So a restricted Omni query is only safe if one of these is true:
 | Shared space, ingestion preserves `resource.attributes['guardian.partition']` | `attribute` | strong |
 | Shared space, each partition is a distinct AWS account/region | `account_region` + policy bindings | medium |
 | Shared space, datasource or log-group convention maps to partitions | `data_source` / `log_group` | medium |
-| Shared space with no trustworthy field | none → `enforces_partition_scope=false` | restricted SQL **refused** |
+| Shared space with no trustworthy field | none → `enforces_partition_scope=false` | restricted SQL **refused**, unless the logical table's `partition` column triggers the legacy fallback (see below) |
 
 > A space **may** hold data from multiple accounts and/or regions. The rows
 > above describe how a partition is expressed, not a single-account limit. For
 > a shared multi-account space, use `account_region`, `log_group`, or
 > `attribute` bindings to scope each query.
 
-**Current bug to fix:** `examples/catalog-multi.yaml` maps the logical
-`partition` column to a physical `partition` field and declares
-`enforces_partition_scope: false`. Because the logical table declares
-`partition`, the emitter currently injects `"partition" IN (...)`; Omni has no
-such field, so the query errors (or silently matches nothing). The binding
-below makes this explicit and validates it at startup.
+The binding model is in `internal/catalog` (`PartitionBinding`,
+`PartitionBindingValue`; `internal/catalog/catalog.go:74-115`), the predicate
+is built by `internal/rewrite/rewrite.go:143-210`, and the six predicate forms
+are emitted by `internal/dialect/dialect.go:176-238`. See
+`PARTITION-POLICY.md` §Phase 2 for the implementation notes.
+
+**Remaining example gap:** `examples/catalog-multi.yaml` leaves `omni-prod`
+without a `partition:` binding while the logical table declares a `partition`
+column and the endpoint maps it to a physical `partition` field. Because
+`buildPartitionFilter` tries the logical `partition` column before checking
+`enforces_partition_scope`, a restricted query still emits `"partition" IN
+(...)` (the literal identifier; the `columns` map is not consulted); Omni has
+no such field, so the query errors (or matches nothing). Add a
+`log_group`, `attribute`, or `account_region` binding to `omni-prod` (or stop
+mapping the logical column to a nonexistent physical field). See `SECURITY.md`
+for the fallback risk.
 
 ## 4. What the endpoint binding needs
 
-An endpoint binding must answer four questions. Today it answers only the first
-two.
+An endpoint binding answers four questions. The implementation answers all
+four; the fourth is derived from the third.
 
 1. **Where is the data?** `Source` — `logs.default`, `strata.logs`,
    `proj.dataset.logs`.
 2. **How do logical columns map to physical fields?** `Columns` — including
-   nested/schemaless fields (`attributes['x']`, `resource['attributes']['x']`).
-   A plain identifier map is not enough for Omni; the binding needs a trusted
-   expression or a structured path.
-3. **How is a partition expressed?** *(new)* — a `PartitionBinding`:
-   `column`, `attribute` (with a path), `account_region`, `data_source`,
-   `log_group`, or `fixed`.
-4. **Can the endpoint enforce the scope?** *(new)* — derived, not hand-written:
-   `enforces_partition_scope = binding != nil`. If false, the endpoint is
-   admin/unrestricted only; the planner refuses it for restricted callers.
+   schemaless names such as `@timestamp`. Nested identity paths (for example
+   `resource['attributes']['guardian.partition']`) are expressed by the
+   partition binding's `Path`, not by a general expression language.
+3. **How is a partition expressed?** — a `PartitionBinding`: `column`,
+   `attribute` (with a path), `account_region`, `data_source`, `log_group`, or
+   `fixed`.
+4. **Can the endpoint enforce the scope?** — derived at catalog load:
+   `enforces_partition_scope = binding != nil` (`internal/catalog/catalog.go:312-319`).
+   If false and the table has no `partition` column, the planner refuses the
+   endpoint for restricted callers.
 
-Proposed catalog types:
+Implemented catalog types (`internal/catalog/catalog.go:74-117`):
 
 ```go
 type PartitionBinding struct {
@@ -251,14 +264,15 @@ type PartitionBinding struct {
 
 type Endpoint struct {
     // ... existing fields ...
-    Partition *PartitionBinding `yaml:"partition,omitempty" json:"partition,omitempty"`
-
-    // Trusted, operator-configured expressions for schemaless fields, e.g.
-    // "timestamp": "@timestamp", "service": "resource['attributes']['service.name']".
-    // Never request-derived; validated at load time.
-    Expressions map[string]string `yaml:"expressions,omitempty" json:"expressions,omitempty"`
+    Partition *PartitionBinding      `yaml:"partition,omitempty" json:"partition,omitempty"`
+    Binding   *PartitionBindingValue `yaml:"-" json:"binding,omitempty"` // filled per routed placement
 }
 ```
+
+`Expressions` was proposed but is **not** part of `catalog.Endpoint`; the
+policy `Placement` schema accepts it, but the emitters do not apply it (see
+`PARTITION-POLICY.md`, remaining gaps). Schemaless Omni fields are therefore
+mapped through `columns` and the partition binding, not arbitrary expressions.
 
 Examples:
 
@@ -298,8 +312,10 @@ Examples:
 
 ### 5.1 A separate `sql` scope
 
-SQL is an aggregation/exfiltration surface; it should be grantable separately
-from logs/traces.
+Status: **implemented** (`pkg/authz/policy`: `ScopeSQL`, `Defaults.SQL`,
+`Subject.SQL`, `Grant.SQL`, `CanReadSQL`, `ResolveVisibleSQLPartitions`). SQL is
+an aggregation/exfiltration surface, so it is grantable separately from
+logs/traces.
 
 ```yaml
 defaults:
@@ -328,12 +344,20 @@ users:
 ```
 
 Evaluation: `VisibleSQLPartitions = VisiblePartitions ∩ SQL`, and `deny: [sql]`
-blocks the surface wholesale. The router's `querySQLScope` uses `CanReadSQL`;
+blocks the surface wholesale. `ResolveVisibleSQLPartitions` exists for hosts;
+the router's `querySQLScope` computes the same intersection directly with
+`VisiblePartitions` + `CanReadSQL` (`monofs/internal/router/access_policy.go:366-401`).
+Doctor's policy gate filters by signal (`CanReadSignal`) and forwards an
+explicit list, which the router narrows again with `CanReadSQL`.
 `QueryLogs`/`QueryTraces` keep their current scopes.
 
 ### 5.2 Generic partition bindings
 
-Generalize `aws_bindings` (keep the old key for compatibility):
+Status: **not implemented as a policy key**. The routing path derives
+`PartitionBindingValue` from the shard's `account`, `region`, `attributes`,
+`data_source`, and `log_groups` rather than from a generic `partition_bindings`
+map. `aws_bindings` is still the only explicit policy mapping. The sketch below
+remains the design for a generic key:
 
 ```yaml
 partition_bindings:
@@ -383,7 +407,9 @@ Fail-closed rules:
 - A `fixed` endpoint whose values do not contain every visible partition →
   error.
 - An endpoint with no binding and `enforces_partition_scope=false` → refused
-  for restricted callers.
+  for restricted callers, **unless** the logical table declares a `partition`
+  column, in which case the legacy `partition` fallback applies (see §3 and
+  `SECURITY.md`).
 - Never "skip the filter because it is hard"; an empty predicate is a bug.
 
 ## 7. Ingest contract (the durable fix)
@@ -441,26 +467,42 @@ Migration:
 
 ## 8. Code changes and tests
 
-1. `pkg/authz/policy`: add `ScopeSQL`, `Defaults.SQL`, `Subject.SQL`,
-   `Grant.SQL`, `CanReadSQL`, `VisibleSQLPartitions`, `Deny: [sql]`, compile
-   validation and lint. Keep `format_version = 1`; deploy the router before a
-   policy that uses `sql`.
-2. `internal/access` (Doctor) and `internal/router`: use
-   `VisibleSQLPartitions`; pass the binding values with the scope.
-3. `pkg/sqlag`: add `PartitionBinding` to the endpoint, `Scope.Bindings`,
-   validation, and per-kind predicate emission. Extend `Emitter`.
-4. `monofs/internal/sqlfederation`: set `column` bindings for local DuckDB and
-   ClickHouse; keep the existing `timestamp` → `time` column mapping.
-5. Driver catalogs for Omni/BigQuery: add the binding and `expressions`.
-6. Ingest: stamp `guardian.partition`; add BQ/CH columns.
-7. Tests:
-   - golden predicates for every binding kind;
-   - policy test: `sql` deny overrides logs access;
-   - Omni shared + attribute: emits the nested path;
-   - Omni shared + no field: `scope_not_enforceable`;
-   - Omni fixed: subset validation;
-   - account/region mapping from `partition_bindings`;
-   - end-to-end: user with partition `tenant-a` sees only `tenant-a` rows.
+Implemented:
+
+1. `pkg/authz/policy`: `ScopeSQL`, `Defaults.SQL`, `Subject.SQL`,
+   `Grant.SQL`, `CanReadSQL`, `ResolveVisibleSQLPartitions`, `Deny: [sql]`,
+   compile validation and lint. `format_version` stays 1; deploy the router
+   before a policy that uses `sql`.
+2. `internal/router`: `querySQLScope` intersects `VisiblePartitions` with
+   `CanReadSQL` and forwards the list on `QuerySQL`. Doctor's policy gate
+   filters by signal and forwards its own list, which the router narrows again;
+   Doctor does not call `VisibleSQLPartitions`.
+3. `pkg/sqlag`: `PartitionBinding` on `Endpoint`, `Scope.Bindings`,
+   validation, and per-kind predicate emission in `internal/rewrite` +
+   `internal/dialect`. Six kinds: `column`, `attribute`, `account_region`,
+   `data_source`, `log_group`, `fixed`.
+4. `monofs/internal/sqlfederation`: routed endpoints carry `Partition` and a
+   per-placement `Binding` built from the shard's account/region/attributes/
+   log groups; the local `timestamp` → `time` column mapping is preserved.
+5. Ingest: `guardian.partition` is stamped and overwritten; BQ/CH columns
+   remain a migration task.
+
+Tests:
+
+- golden predicates for every binding kind;
+- policy test: `sql` deny overrides logs access;
+- Omni shared + attribute: emits the nested path;
+- Omni shared + no field: `scope_not_enforceable`;
+- Omni fixed: subset validation;
+- account/region mapping from the routed shard attributes;
+- end-to-end: user with partition `tenant-a` sees only `tenant-a` rows.
+
+Remaining:
+
+- apply `expressions` / `indexed_fields`, which the policy schema accepts but
+  the emitters ignore;
+- add a `partition:` binding to `examples/catalog-multi.yaml`'s `omni-prod`
+  (see §3).
 
 ## 9. Decision matrix for Omni
 
@@ -468,7 +510,7 @@ Migration:
 |---|---|
 | Shared space, one log group per partition (CloudWatch OTLP logs) | **primary for logs:** `log_group` (`@logGroupName`) |
 | Shared space, OTLP resource attributes preserved (traces/metrics) | **primary for traces:** `attribute` with `guardian.partition` |
-| Shared space, partitions are AWS accounts/regions | `account_region` + `partition_bindings` |
+| Shared space, partitions are AWS accounts/regions | `account_region` + shard account/region attributes |
 | Shared space, one datasource per tenant | `data_source` |
 | One space per tenant | optional `fixed`; not the default plan |
 | Shared space, no stable field | do **not** enable restricted SQL on it |
